@@ -139,8 +139,10 @@ std::vector<Event> Sensor::readEvents() {
     event.sensorHandle = mSensorInfo.sensorHandle;
     event.sensorType = mSensorInfo.type;
     event.timestamp = ::android::elapsedRealtimeNano();
-    memset(&event.u, 0, sizeof(event.u));
-    readEventPayload(event.u);
+    event.u.vec3.x = 0;
+    event.u.vec3.y = 0;
+    event.u.vec3.z = 0;
+    event.u.vec3.status = SensorStatus::ACCURACY_HIGH;
     events.push_back(event);
     return events;
 }
@@ -188,7 +190,7 @@ std::vector<Event> OnChangeSensor::readEvents() {
 
     for (auto iter = events.begin(); iter != events.end(); ++iter) {
         Event ev = *iter;
-        if (!mPreviousEventSet || memcmp(&mPreviousEvent.u, &ev.u, sizeof(ev.u)) != 0) {
+        if (ev.u.vec3 != mPreviousEvent.u.vec3 || !mPreviousEventSet) {
             outputEvents.push_back(ev);
             mPreviousEvent = ev;
             mPreviousEventSet = true;
@@ -207,7 +209,7 @@ AccelSensor::AccelSensor(int32_t sensorHandle, ISensorsEventCallback* callback) 
     mSensorInfo.maxRange = 78.4f;  // +/- 8g
     mSensorInfo.resolution = 1.52e-5;
     mSensorInfo.power = 0.001f;        // mA
-    mSensorInfo.minDelay = 10 * 1000;  // microseconds
+    mSensorInfo.minDelay = 20 * 1000;  // microseconds
     mSensorInfo.maxDelay = kDefaultMaxDelayUs;
     mSensorInfo.fifoReservedEventCount = 0;
     mSensorInfo.fifoMaxEventCount = 0;
