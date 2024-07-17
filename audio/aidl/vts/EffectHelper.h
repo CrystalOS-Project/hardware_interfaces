@@ -21,6 +21,7 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <Utils.h>
@@ -34,15 +35,18 @@
 #include <system/audio_effects/aidl_effects_utils.h>
 #include <system/audio_effects/effect_uuid.h>
 
-#include "AudioHalBinderServiceUtil.h"
 #include "EffectFactoryHelper.h"
 #include "TestUtils.h"
+#include "pffft.hpp"
 
 using namespace android;
 using aidl::android::hardware::audio::effect::CommandId;
 using aidl::android::hardware::audio::effect::Descriptor;
 using aidl::android::hardware::audio::effect::IEffect;
+using aidl::android::hardware::audio::effect::kEventFlagDataMqNotEmpty;
+using aidl::android::hardware::audio::effect::kEventFlagDataMqUpdate;
 using aidl::android::hardware::audio::effect::kEventFlagNotEmpty;
+using aidl::android::hardware::audio::effect::kReopenSupportedVersion;
 using aidl::android::hardware::audio::effect::Parameter;
 using aidl::android::hardware::audio::effect::Range;
 using aidl::android::hardware::audio::effect::State;
@@ -156,7 +160,7 @@ class EffectHelper {
         std::fill(buffer.begin(), buffer.end(), 0x5a);
     }
     static void writeToFmq(std::unique_ptr<StatusMQ>& statusMq, std::unique_ptr<DataMQ>& dataMq,
-                           const std::vector<float>& buffer) {
+                           const std::vector<float>& buffer, int version) {
         const size_t available = dataMq->availableToWrite();
         ASSERT_NE(0Ul, available);
         auto bufferFloats = buffer.size();
@@ -167,7 +171,8 @@ class EffectHelper {
         ASSERT_EQ(::android::OK,
                   EventFlag::createEventFlag(statusMq->getEventFlagWord(), &efGroup));
         ASSERT_NE(nullptr, efGroup);
-        efGroup->wake(kEventFlagNotEmpty);
+        efGroup->wake(version >= kReopenSupportedVersion ? kEventFlagDataMqNotEmpty
+                                                         : kEventFlagNotEmpty);
         ASSERT_EQ(::android::OK, EventFlag::deleteEventFlag(&efGroup));
     }
     static void readFromFmq(std::unique_ptr<StatusMQ>& statusMq, size_t statusNum,
@@ -189,6 +194,16 @@ class EffectHelper {
         if (expectFloats != 0) {
             ASSERT_TRUE(dataMq->read(buffer.data(), expectFloats));
         }
+    }
+    static void expectDataMqUpdateEventFlag(std::unique_ptr<StatusMQ>& statusMq) {
+        EventFlag* efGroup;
+        ASSERT_EQ(::android::OK,
+                  EventFlag::createEventFlag(statusMq->getEventFlagWord(), &efGroup));
+        ASSERT_NE(nullptr, efGroup);
+        uint32_t efState = 0;
+        EXPECT_EQ(::android::OK, efGroup->wait(kEventFlagDataMqUpdate, &efState, 1'000'000 /*1ms*/,
+                                               true /* retry */));
+        EXPECT_TRUE(efState & kEventFlagDataMqUpdate);
     }
     static Parameter::Common createParamCommon(
             int session = 0, int ioHandle = -1, int iSampleRate = 48000, int oSampleRate = 48000,
@@ -263,12 +278,11 @@ class EffectHelper {
         return s;
     }
 
-    template <typename T, typename S, Range::Tag R, typename T::Tag tag, typename Functor>
+    template <typename T, typename S, Range::Tag R, typename T::Tag tag>
     static std::set<S> getTestValueSet(
-            std::vector<std::pair<std::shared_ptr<IFactory>, Descriptor>> kFactoryDescList,
-            Functor functor) {
+            std::vector<std::pair<std::shared_ptr<IFactory>, Descriptor>> descList) {
         std::set<S> result;
-        for (const auto& [_, desc] : kFactoryDescList) {
+        for (const auto& [_, desc] : descList) {
             if (desc.capability.range.getTag() == R) {
                 const auto& ranges = desc.capability.range.get<R>();
                 for (const auto& range : ranges) {
@@ -281,6 +295,14 @@ class EffectHelper {
                 }
             }
         }
+        return result;
+    }
+
+    template <typename T, typename S, Range::Tag R, typename T::Tag tag, typename Functor>
+    static std::set<S> getTestValueSet(
+            std::vector<std::pair<std::shared_ptr<IFactory>, Descriptor>> descList,
+            Functor functor) {
+        auto result = getTestValueSet<T, S, R, tag>(descList);
         return functor(result);
     }
 
@@ -301,7 +323,10 @@ class EffectHelper {
         ASSERT_NO_FATAL_FAILURE(expectState(mEffect, State::PROCESSING));
 
         // Write from buffer to message queues and calling process
-        EXPECT_NO_FATAL_FAILURE(EffectHelper::writeToFmq(statusMQ, inputMQ, inputBuffer));
+        EXPECT_NO_FATAL_FAILURE(EffectHelper::writeToFmq(statusMQ, inputMQ, inputBuffer, [&]() {
+            int version = 0;
+            return (mEffect && mEffect->getInterfaceVersion(&version).isOk()) ? version : 0;
+        }()));
 
         // Read the updated message queues into buffer
         EXPECT_NO_FATAL_FAILURE(EffectHelper::readFromFmq(statusMQ, 1, outputMQ,
@@ -310,5 +335,46 @@ class EffectHelper {
         // Disable the process
         ASSERT_NO_FATAL_FAILURE(command(mEffect, CommandId::RESET));
         ASSERT_NO_FATAL_FAILURE(expectState(mEffect, State::IDLE));
+    }
+
+    // Find FFT bin indices for testFrequencies and get bin center frequencies
+    void roundToFreqCenteredToFftBin(std::vector<int>& testFrequencies,
+                                     std::vector<int>& binOffsets, const float kBinWidth) {
+        for (size_t i = 0; i < testFrequencies.size(); i++) {
+            binOffsets[i] = std::round(testFrequencies[i] / kBinWidth);
+            testFrequencies[i] = std::round(binOffsets[i] * kBinWidth);
+        }
+    }
+
+    // Generate multitone input between -1 to +1 using testFrequencies
+    void generateMultiTone(const std::vector<int>& testFrequencies, std::vector<float>& input,
+                           const int samplingFrequency) {
+        for (size_t i = 0; i < input.size(); i++) {
+            input[i] = 0;
+
+            for (size_t j = 0; j < testFrequencies.size(); j++) {
+                input[i] += sin(2 * M_PI * testFrequencies[j] * i / samplingFrequency);
+            }
+            input[i] /= testFrequencies.size();
+        }
+    }
+
+    // Use FFT transform to convert the buffer to frequency domain
+    // Compute its magnitude at binOffsets
+    std::vector<float> calculateMagnitude(const std::vector<float>& buffer,
+                                          const std::vector<int>& binOffsets, const int nPointFFT) {
+        std::vector<float> fftInput(nPointFFT);
+        PFFFT_Setup* inputHandle = pffft_new_setup(nPointFFT, PFFFT_REAL);
+        pffft_transform_ordered(inputHandle, buffer.data(), fftInput.data(), nullptr,
+                                PFFFT_FORWARD);
+        pffft_destroy_setup(inputHandle);
+        std::vector<float> bufferMag(binOffsets.size());
+        for (size_t i = 0; i < binOffsets.size(); i++) {
+            size_t k = binOffsets[i];
+            bufferMag[i] = sqrt((fftInput[k * 2] * fftInput[k * 2]) +
+                                (fftInput[k * 2 + 1] * fftInput[k * 2 + 1]));
+        }
+
+        return bufferMag;
     }
 };
